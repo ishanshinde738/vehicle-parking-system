@@ -1,0 +1,150 @@
+"""
+Entry Gate Service
+Monitors entry camera and processes vehicle entries
+"""
+
+import cv2
+import time
+from datetime import datetime
+from camera_manager import CameraManager
+from detection_service import VehicleDetectionService
+from flask import Flask
+from database import db, ParkingSlot
+import sys
+import os
+
+# Add application path to sys.path
+sys.path.insert(0, os.path.dirname(__file__))
+
+# Import app functions
+from app import log_vehicle_entry
+
+def run_entry_gate_service():
+    """Main entry gate service"""
+    
+    print("=" * 70)
+    print("ENTRY GATE SERVICE")
+    print("=" * 70)
+    
+    # Configuration
+    CAMERA_URL = 0  # Use 0 for webcam, or RTSP URL for IP camera
+    MODEL_PATH = "best.pt"
+    DETECTION_COOLDOWN = 5  # Seconds between detections
+    
+    print(f"\n⚙️  Configuration:")
+    print(f"   Camera: {CAMERA_URL}")
+    print(f"   Model: {MODEL_PATH}")
+    print(f"   Cooldown: {DETECTION_COOLDOWN}s")
+    
+    # Initialize camera
+    camera = CameraManager(CAMERA_URL, 'ENTRY_GATE_1')
+    
+    if not camera.connect():
+        print("\n❌ Failed to connect to camera")
+        return
+    
+    # Initialize detection service
+    if not os.path.exists(MODEL_PATH):
+        print(f"\n❌ Model not found: {MODEL_PATH}")
+        print("   Please copy best.pt from training/runs/detect/vehicle_detection_v1/weights/")
+        camera.disconnect()
+        return
+    
+    detection_service = VehicleDetectionService(MODEL_PATH, confidence_threshold=0.5)
+    if not detection_service.load_model():
+        print("\n❌ Failed to load model")
+        camera.disconnect()
+        return
+    
+    # Initialize Flask app for database access
+    app = Flask(__name__)
+    basedir = os.path.abspath(os.path.dirname(__file__))
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(basedir, "parking_system.db")}'
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+    
+    # Start camera capture
+    camera.start_capture()
+    
+    print("\n" + "=" * 70)
+    print("✅ ENTRY GATE SERVICE RUNNING")
+    print("=" * 70)
+    print("\n📹 Monitoring entry gate...")
+    print("⚠️  Press CTRL+C to stop\n")
+    
+    last_detection_time = 0
+    
+    try:
+        while True:
+            # Get frame from camera
+            frame = camera.get_frame()
+            
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            
+            # Check if cooldown period has passed
+            current_time = time.time()
+            if current_time - last_detection_time < DETECTION_COOLDOWN:
+                time.sleep(0.1)
+                continue
+            
+            # Run detection
+            detections = detection_service.detect_vehicles(frame)
+            
+            if len(detections) > 0:
+                print(f"\n🚗 {datetime.now().strftime('%H:%M:%S')} - Detected {len(detections)} vehicle(s)")
+                
+                # Process each detection
+                with app.app_context():
+                    for detection in detections:
+                        print(f"\n   Vehicle Details:")
+                        print(f"      Category: {detection['display_category']}")
+                        print(f"      Original Class: {detection['original_class']}")
+                        print(f"      Confidence: {detection['confidence']:.2%}")
+                        print(f"      Parking Applicable: {detection['parking_applicable']}")
+                        
+                        # Save detection image
+                        image_path = detection_service.save_detection_image(
+                            frame, [detection], prefix='entry'
+                        )
+                        print(f"      Image saved: {image_path}")
+                        
+                        # Check parking availability for cars
+                        if detection['parking_applicable']:
+                            parking = ParkingSlot.query.first()
+                            if parking and parking.available_count > 0:
+                                print(f"      ✅ Parking Available: {parking.available_count} slots")
+                            else:
+                                print(f"      ❌ PARKING FULL - Entry denied")
+                                continue
+                        
+                        # Log entry to database
+                        success, message, entry_id = log_vehicle_entry(
+                            detection, image_path, 'ENTRY_GATE_1'
+                        )
+                        
+                        if success:
+                            print(f"      ✅ {message} (Entry ID: {entry_id})")
+                        else:
+                            print(f"      ❌ {message}")
+                
+                last_detection_time = current_time
+                print(f"\n⏳ Next detection in {DETECTION_COOLDOWN} seconds...")
+            
+            # Small delay
+            time.sleep(0.1)
+    
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Stopping entry gate service...")
+    
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    
+    finally:
+        camera.stop_capture()
+        camera.disconnect()
+        print("✅ Entry gate service stopped")
+
+if __name__ == "__main__":
+    run_entry_gate_service()
